@@ -1,0 +1,564 @@
+# docker-compose.yml - Complete production environment
+version: '3.8'
+
+services:
+  # Redis for fast memory access and caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    networks:
+      - reconsideration_network
+
+  # PostgreSQL for persistent metadata storage
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: reconsideration_db
+      POSTGRES_USER: recon_user
+      POSTGRES_PASSWORD: secure_password_123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - reconsideration_network
+
+  # Main reconsideration API service
+  reconsideration-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://recon_user:secure_password_123@postgres/reconsideration_db
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT}
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - reconsideration_network
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+
+  # Celery worker for distributed processing
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://recon_user:secure_password_123@postgres/reconsideration_db
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - reconsideration_network
+    deploy:
+      replicas: 4
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+
+  # Celery Flower for monitoring
+  flower:
+    image: mher/flower:0.9.7
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - FLOWER_PORT=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - reconsideration_network
+
+  # Nginx load balancer
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/ssl/certs
+    depends_on:
+      - reconsideration-api
+    networks:
+      - reconsideration_network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - reconsideration_network
+
+  # Grafana for metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - reconsideration_network
+
+  # ELK Stack for logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - reconsideration_network
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.5.0
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    depends_on:
+      - elasticsearch
+    networks:
+      - reconsideration_network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.5.0
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - reconsideration_network
+
+networks:
+  reconsideration_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  elasticsearch_data:
+
+---
+# Dockerfile.api - API service container
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download spaCy model
+RUN python -m spacy download en_core_web_sm
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/api/v2/metrics || exit 1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+---
+# Dockerfile.worker - Celery worker container
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN python -m spacy download en_core_web_sm
+
+COPY . .
+
+RUN mkdir -p logs
+
+CMD ["celery", "-A", "main.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+
+---
+# requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+redis==5.0.1
+aioredis==2.0.1
+asyncpg==0.29.0
+sentence-transformers==2.2.2
+pinecone-client==2.2.4
+celery==5.3.4
+spacy==3.7.2
+scikit-learn==1.3.2
+numpy==1.24.3
+aiohttp==3.9.1
+pydantic==2.5.0
+python-multipart==0.0.6
+prometheus-client==0.19.0
+structlog==23.2.0
+python-json-logger==2.0.4
+
+---
+# nginx.conf - Load balancer configuration
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream api_servers {
+        server reconsideration-api:8000;
+    }
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    
+    # Security headers
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains";
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        # API endpoints
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            
+            proxy_pass http://api_servers;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+            
+            # WebSocket support
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+
+        # Health check endpoint
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+
+        # Static files (if any)
+        location /static/ {
+            alias /app/static/;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+}
+
+---
+# prometheus.yml - Metrics collection configuration
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: 'reconsideration-api'
+    static_configs:
+      - targets: ['reconsideration-api:8000']
+    metrics_path: '/api/v2/metrics/prometheus'
+    scrape_interval: 30s
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+---
+# logstash.conf - Log processing configuration
+input {
+  beats {
+    port => 5044
+  }
+  
+  tcp {
+    port => 5000
+    codec => json_lines
+  }
+}
+
+filter {
+  if [fields][service] == "reconsideration-api" {
+    json {
+      source => "message"
+    }
+    
+    date {
+      match => [ "timestamp", "ISO8601" ]
+    }
+    
+    if [level] == "ERROR" {
+      mutate {
+        add_tag => [ "error" ]
+      }
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "reconsideration-logs-%{+YYYY.MM.dd}"
+  }
+  
+  # Also output to stdout for debugging
+  stdout {
+    codec => rubydebug
+  }
+}
+
+---
+# kubernetes-deployment.yaml - Kubernetes deployment configuration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconsideration-api
+  labels:
+    app: reconsideration-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: reconsideration-api
+  template:
+    metadata:
+      labels:
+        app: reconsideration-api
+    spec:
+      containers:
+      - name: api
+        image: reconsideration-system:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-service:6379"
+        - name: POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: url
+        - name: PINECONE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pinecone-secret
+              key: api-key
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/v2/metrics
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/v2/metrics
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reconsideration-api-service
+spec:
+  selector:
+    app: reconsideration-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: LoadBalancer
+
+---
+# helm-chart/values.yaml - Helm chart configuration
+replicaCount: 3
+
+image:
+  repository: reconsideration-system
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+  hosts:
+    - host: api.reconsideration.ai
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: reconsideration-tls
+      hosts:
+        - api.reconsideration.ai
+
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "secure-password"
+    username: "recon_user"
+    password: "user-password"
+    database: "reconsideration_db"
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+---
+# .env.example - Environment variables template
+# Database Configuration
+REDIS_URL=redis://localhost:6379
+POSTGRES_URL=postgresql://recon_user:password@localhost/reconsideration_db
+
+# Vector Database
+PINECONE_API_KEY=your-pinecone-api-key
+PINECONE_ENVIRONMENT=production
+PINECONE_INDEX_NAME=memory-embeddings
+
+# Celery Configuration
+CELERY_BROKER_URL=redis://localhost:6379/1
+CELERY_RESULT_BACKEND=redis://localhost:6379/2
+
+# API Configuration
+API_HOST=0.0.0.0
+API_PORT=8000
+API_WORKERS=4
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FORMAT=json
+
+# Security
+SECRET_KEY=your-secret-key-here
+JWT_SECRET=your-jwt-secret
+
+# Performance Tuning
+RECONSIDERATION_BATCH_SIZE=100
+MAX_RELATED_MEMORIES=50
+CONSENSUS_THRESHOLD=0.7
+CONFIDENCE_THRESHOLD=0.3
+TEMPORAL_DECAY_RATE=0.95
+
+# Monitoring
+PROMETHEUS_ENABLED=true
+METRICS_PORT=9000
+
+# Webhooks
+WEBHOOK_TIMEOUT=30
+MAX_WEBHOOK_RETRIES=3p
